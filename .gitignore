@@ -1,0 +1,28 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+
+# Runtime data
+pids
+*.pid
+*.seed
+
+# Dependencies / builds
+node_modules/
+dist/
+*.tsbuildinfo
+*.tgz
+
+# Coverage / caches
+coverage/
+.nyc_output
+.eslintcache
+.cache
+
+# Env files
+.env
+.env.*.local
+
+# OS
+.DS_Store
