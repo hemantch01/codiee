@@ -15,7 +15,7 @@ datasource db {
 }
 
 model User {
-  id            String    @id
+  id            String    @id 
   name          String
   email         String
   emailVerified Boolean   @default(false)
@@ -26,6 +26,7 @@ model User {
   accounts      Account[]
 
   conversation Conversation[]
+  chunks       ProjectChunk[]
 
   @@unique([email])
   @@map("user")
@@ -76,26 +77,12 @@ model Verification {
   @@map("verification")
 }
 
-model DeviceCode {
-  id              String    @id
-  deviceCode      String
-  userCode        String
-  userId          String?
-  expiresAt       DateTime
-  status          String
-  lastPolledAt    DateTime?
-  pollingInterval Int?
-  clientId        String?
-  scope           String?
-
-  @@map("deviceCode")
-}
-
 model Conversation {
   id  String @id @default(cuid())
   userId String
   title  String?
   mode  String @default("chat") // chat | tool
+  summary String? // rolling summary of older messages (context management)
   createdAt DateTime @default(now())
   updatedAt DateTime @default(now()) @updatedAt
 
@@ -114,4 +101,45 @@ model Message {
   conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
   
   @@index([conversationId])
+}
+
+// Server-side monthly token quota per user. Counters reset when the calendar
+// month rolls over (periodStart is compared against the current month start).
+// The CLI reports usage after each AI call and checks remaining quota before
+// issuing new requests.
+model UsageCounter {
+  id               String   @id @default(cuid())
+  userId           String   @unique
+  promptTokens     BigInt   @default(0)
+  completionTokens BigInt   @default(0)
+  totalTokens      BigInt   @default(0)
+  requests         Int      @default(0)
+  periodStart      DateTime
+  updatedAt        DateTime @updatedAt
+
+  @@map("usage_counter")
+}
+
+// Semantic code index for RAG (pgvector).
+// The `embedding` column is pgvector's `vector(768)` type (Gemini
+// gemini-embedding-001 output). Prisma cannot model vector columns natively,
+// so it is declared Unsupported() and accessed via $queryRaw/$executeRaw.
+// The HNSW similarity index is created with raw SQL in the migration.
+model ProjectChunk {
+  id          String                       @id @default(cuid())
+  userId      String
+  rootPath    String
+  filePath    String
+  chunkIndex  Int
+  content     String
+  contentHash String
+  embedding   Unsupported("vector(768)")?
+  createdAt   DateTime                     @default(now())
+  updatedAt   DateTime                     @default(now()) @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, rootPath, filePath, chunkIndex])
+  @@index([userId, rootPath])
+  @@map("project_chunk")
 }
