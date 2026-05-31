@@ -1,12 +1,20 @@
 import "./lib/env.js";
 import express from "express";
 import { auth } from "./lib/auth.js";
-import { toNodeHandler } from "better-auth/node";
+import { fromNodeHeaders, toNodeHandler } from "better-auth/node";
 import helmet from "helmet";
+import rateLimit from "express-rate-limit";
 import { pathToFileURL } from "url";
 import { pinoHttp } from "pino-http";
 import prisma from "./lib/db.js";
 import { logger } from "./lib/logger.js";
+import { getQuota, recordUsage, type UsageReportInput } from "./services/quota.services.js";
+import { ChatService } from "./services/chat.services.js";
+import { issueOtp, verifyOtp } from "./lib/otp.js";
+import { sendOtpEmail } from "./lib/mailer.js";
+import { EMAIL_RE } from "./lib/email.js";
+
+const chatService = new ChatService();
 
 export const app = express();
 const port = Number(process.env.PORT || 3005);
@@ -23,10 +31,90 @@ app.use(
   })
 );
 
-// Better-auth catch-all: signup/signin/session flows live under /api/auth
-app.all("/api/auth/*splat", toNodeHandler(auth));
+// Rate limiters (per IP). Health/readiness probes are exempt so monitoring
+// and orchestrators can poll freely.
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 50,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many attempts — try again later." },
+});
+
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Rate limit exceeded — slow down." },
+});
+
+// Signup via email OTP. Registered BEFORE the better-auth catch-all below so
+// these paths aren't swallowed by it; route-level express.json() because the
+// global body parser mounts after the auth handler.
+
+app.post("/api/auth/signup/send-otp", authLimiter, express.json(), async (req, res) => {
+  const body = (req.body ?? {}) as { email?: string };
+  const email = String(body.email ?? "").trim().toLowerCase();
+  if (!EMAIL_RE.test(email)) {
+    return res.status(400).json({ error: "Invalid email address" });
+  }
+
+  const existing = await prisma.user.findUnique({ where: { email }, select: { id: true } });
+  if (existing) {
+    return res.status(409).json({ error: "This email is already registered. Sign in via `codiee wakeup`." });
+  }
+
+  const issued = issueOtp(email);
+  if (!issued.ok) {
+    return res.status(429).json({ error: "OTP already sent — wait a minute before requesting again." });
+  }
+
+  try {
+    await sendOtpEmail(email, issued.code);
+  } catch (error) {
+    logger.error({ err: error }, "OTP email send failed");
+    return res.status(500).json({ error: "Could not send the verification email. Try again." });
+  }
+  return res.json({ ok: true });
+});
+
+app.post("/api/auth/signup/complete", authLimiter, express.json(), async (req, res) => {
+  const body = (req.body ?? {}) as { email?: string; otp?: string; password?: string };
+  const email = String(body.email ?? "").trim().toLowerCase();
+  const otp = String(body.otp ?? "").trim();
+  const password = String(body.password ?? "");
+
+  if (!EMAIL_RE.test(email)) return res.status(400).json({ error: "Invalid email address" });
+  if (password.length < 8) return res.status(400).json({ error: "Password must be at least 8 characters" });
+
+  const verdict = verifyOtp(email, otp);
+  if (!verdict.ok) {
+    return res.status(400).json({ error: `Invalid or expired code (${verdict.reason})` });
+  }
+
+  const existing = await prisma.user.findUnique({ where: { email }, select: { id: true } });
+  if (existing) {
+    return res.status(409).json({ error: "This email is already registered. Sign in via `codiee wakeup`." });
+  }
+
+  try {
+    const result = await auth.api.signUpEmail({
+      body: { email, password, name: email.split("@")[0] },
+    });
+    await prisma.user.update({ where: { email }, data: { emailVerified: true } });
+    return res.json({ token: result.token, user: result.user });
+  } catch (error) {
+    logger.error({ err: error }, "Signup failed");
+    return res.status(500).json({ error: "Could not create the account. Try again." });
+  }
+});
+
+app.all("/api/auth/*splat", authLimiter, toNodeHandler(auth));
 
 app.use(express.json());
+
+// Probes (exempt from rate limiting)
 
 // Liveness probe: is the process up? (no dependencies checked)
 app.get("/health", (_req, res) => {
@@ -42,6 +130,187 @@ app.get("/ready", async (_req, res) => {
     logger.error({ err: error }, "Readiness check failed");
     return res.status(503).json({ status: "unavailable", reason: "database unreachable" });
   }
+});
+
+// Authenticated API
+
+/** Resolve the session user id from a Bearer token or session cookie. */
+async function requireUserId(req: express.Request): Promise<string | null> {
+  const session = await auth.api.getSession({
+    headers: fromNodeHeaders(req.headers),
+  });
+  return session?.user?.id ?? null;
+}
+
+app.use("/api", apiLimiter);
+
+app.get("/api/me", async (req, res) => {
+  try {
+    const session = await auth.api.getSession({
+      headers: fromNodeHeaders(req.headers),
+    });
+
+    if (!session) {
+      return res.status(401).json({ error: "No active session" });
+    }
+
+    return res.json(session);
+  } catch (error) {
+    logger.error({ err: error }, "Session error");
+    return res.status(500).json({ error: "Failed to get session" });
+  }
+});
+
+app.get("/device", async (_req, res) => {
+  res.status(410).json({ error: "Device flow removed — run `codiee wakeup` to sign in" });
+});
+
+// Quota API
+
+// Current quota snapshot for the authenticated user
+app.get("/api/quota", async (req, res) => {
+  const userId = await requireUserId(req);
+  if (!userId) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  try {
+    return res.json(await getQuota(userId));
+  } catch (error) {
+    logger.error({ err: error }, "Quota lookup failed");
+    return res.status(500).json({ error: "Failed to read quota" });
+  }
+});
+
+// Report token usage after an AI call; enforces the monthly limit
+app.post("/api/usage/record", async (req, res) => {
+  const userId = await requireUserId(req);
+  if (!userId) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  const body = (req.body ?? {}) as UsageReportInput;
+  if (
+    (body.promptTokens !== undefined && !Number.isFinite(Number(body.promptTokens))) ||
+    (body.completionTokens !== undefined && !Number.isFinite(Number(body.completionTokens)))
+  ) {
+    return res.status(400).json({ error: "promptTokens and completionTokens must be numbers" });
+  }
+
+  try {
+    const { outcome, quota } = await recordUsage(userId, body);
+    return res.json({
+      outcome,
+      allowed: quota.remaining > 0,
+      remaining: quota.remaining,
+      limit: quota.limit,
+      used: quota.used,
+      periodEnd: quota.periodEnd,
+    });
+  } catch (error) {
+    logger.error({ err: error }, "Usage recording failed");
+    return res.status(500).json({ error: "Failed to record usage" });
+  }
+});
+
+// Conversation API — the CLI is a pure HTTP client; all persistence lives here.
+const CONVERSATION_MODES = new Set(["chat", "tool"]);
+
+app.get("/api/conversations", apiLimiter, async (req, res) => {
+  const userId = await requireUserId(req);
+  if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+  const take = Math.min(Math.max(Number(req.query.take) || 50, 1), 100);
+  const conversations = await prisma.conversation.findMany({
+    where: { userId },
+    orderBy: { updatedAt: "desc" },
+    take,
+    include: { messages: { take: 1, orderBy: { createdAt: "desc" } } },
+  });
+  return res.json({ conversations });
+});
+
+app.post("/api/conversations", apiLimiter, express.json(), async (req, res) => {
+  const userId = await requireUserId(req);
+  if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+  const body = (req.body ?? {}) as { mode?: string; conversationId?: string };
+  const mode = CONVERSATION_MODES.has(String(body.mode)) ? String(body.mode) : "chat";
+  const conversation = await chatService.getOrCreateConversation(
+    userId,
+    body.conversationId ?? null,
+    mode
+  );
+  return res.json({ conversation });
+});
+
+app.get("/api/conversations/:id", apiLimiter, async (req, res) => {
+  const userId = await requireUserId(req);
+  if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+  const conversation = await prisma.conversation.findFirst({
+    where: { id: String(req.params.id), userId },
+    include: { messages: { orderBy: { createdAt: "asc" } } },
+  });
+  if (!conversation) return res.status(404).json({ error: "Conversation not found" });
+  return res.json({ conversation });
+});
+
+app.patch("/api/conversations/:id", apiLimiter, express.json(), async (req, res) => {
+  const userId = await requireUserId(req);
+  if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+  const body = (req.body ?? {}) as { title?: string; mode?: string; summary?: string };
+  const data: Record<string, string> = {};
+  if (typeof body.title === "string") data.title = body.title;
+  if (typeof body.mode === "string") {
+    if (!CONVERSATION_MODES.has(body.mode)) {
+      return res.status(400).json({ error: "Invalid mode" });
+    }
+    data.mode = body.mode;
+  }
+  if (typeof body.summary === "string") data.summary = body.summary;
+  if (Object.keys(data).length === 0) {
+    return res.status(400).json({ error: "Nothing to update" });
+  }
+
+  const existing = await prisma.conversation.findFirst({
+    where: { id: String(req.params.id), userId },
+    select: { id: true },
+  });
+  if (!existing) return res.status(404).json({ error: "Conversation not found" });
+
+  await prisma.conversation.update({ where: { id: existing.id }, data });
+  return res.json({ ok: true });
+});
+
+app.delete("/api/conversations/:id", apiLimiter, async (req, res) => {
+  const userId = await requireUserId(req);
+  if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+  const result = await prisma.conversation.deleteMany({ where: { id: String(req.params.id), userId } });
+  if (result.count === 0) return res.status(404).json({ error: "Conversation not found" });
+  return res.json({ ok: true });
+});
+
+app.post("/api/conversations/:id/messages", apiLimiter, express.json(), async (req, res) => {
+  const userId = await requireUserId(req);
+  if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+  const body = (req.body ?? {}) as { role?: string; content?: string | object };
+  if (!body.role || body.content === undefined) {
+    return res.status(400).json({ error: "role and content are required" });
+  }
+
+  const conversation = await prisma.conversation.findFirst({
+    where: { id: String(req.params.id), userId },
+    select: { id: true },
+  });
+  if (!conversation) return res.status(404).json({ error: "Conversation not found" });
+
+  const message = await chatService.addMessage(conversation.id, body.role, body.content);
+  const count = await prisma.message.count({ where: { conversationId: conversation.id } });
+  return res.json({ message, count });
 });
 
 // Express 5 wildcard fallback for unknown routes
@@ -86,4 +355,4 @@ if (isDirectRun()) {
   });
 }
 
-// OTP signup, conversations, quota and rag routes added later
+// Rag sync routes (diff / upsert / search) added later
