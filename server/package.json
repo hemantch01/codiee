@@ -27,6 +27,7 @@
     "dotenv": "^17.2.3",
     "express": "^5.1.0",
     "express-rate-limit": "^8.6.2",
+    "figlet": "^1.9.3",
     "helmet": "^8.3.0",
     "marked": "^15.0.12",
     "marked-terminal": "^7.3.0",
