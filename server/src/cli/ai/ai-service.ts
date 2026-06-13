@@ -5,6 +5,8 @@ import chalk from "chalk";
 import {
   loadConfigSync,
   resolveApiKey,
+  resolveProviderKey,
+  PROVIDERS,
 } from "../../config/ai.config.js";
 import { acquire } from "../../lib/rate-limiter.js";
 
@@ -32,12 +34,31 @@ function readConfigSync() {
 }
 
 /** Resolve the configured model into an AI SDK model instance:
- * google or a local ollama endpoint (via config / .codiee.json overrides). */
+ * google, ollama, openrouter or nvidia (all via config / .codiee.json overrides). */
 function resolveModel(cfg: Record<string, any>) {
   if (cfg.provider === "ollama") {
     const baseURL = process.env.OLLAMA_BASE_URL || "http://localhost:11434/v1";
     const ollama = createOpenAICompatible({ name: "ollama", baseURL });
     return ollama.chatModel(cfg.model);
+  }
+
+  if (cfg.provider === "openrouter" || cfg.provider === "nvidia") {
+    const meta = (PROVIDERS as readonly any[]).find((p) => p.id === cfg.provider);
+    const apiKey = resolveProviderKey(cfg, cfg.provider);
+    if (!apiKey) {
+      throw new Error(
+        `No ${meta?.name ?? cfg.provider} API key found. Run /models inside a chat\n` +
+          `session to pick a provider and paste your key${
+            meta?.keyEnv ? `, or set ${meta.keyEnv} in .env` : ""
+          }.`
+      );
+    }
+    const provider = createOpenAICompatible({
+      name: cfg.provider,
+      baseURL: meta?.baseURL,
+      apiKey,
+    });
+    return provider.chatModel(cfg.model);
   }
 
   const apiKey = resolveApiKey(cfg);
@@ -162,4 +183,3 @@ export class AIService {
   }
 }
 
-// Openrouter and nvidia hosted-model fallbacks added later.
