@@ -1,4 +1,5 @@
 import chalk from "chalk";
+import { cancel, confirm, isCancel } from "@clack/prompts";
 import { marked } from "marked";
 import { AIService } from "../ai/ai-service.js";
 import { api } from "../api.js";
@@ -6,8 +7,11 @@ import { applyStoredTheme, applyMarkdownTheme, t } from "../../config/themes.js"
 import { printSessionHeader, printGoodbye } from "../ui/banner.js";
 import {
   userMessage,
+  infoBox,
   errorBox,
   warningBox,
+  toolCallCard,
+  toolResultCard,
   responseHeader,
   responseFooter,
   chatInput,
@@ -22,17 +26,29 @@ import {
   estimateTokens,
   CONTEXT_LIMITS,
 } from "../../lib/context-manager.js";
+import { handleChatCommand } from "./slash-commands.js";
+import {
+  availableTools,
+  getEnabledTools,
+  enableTools,
+  getEnabledToolNames,
+  resetTools,
+} from "../../config/tool.config.js";
+import { generateApplication } from "../../config/agent.config.js";
+import { offerToRunSetupCommands } from "../../lib/sandbox.js";
 import type { AIMessage } from "../ai/ai-service.js";
 
 /**
- * Codiee chat session — one persistent chat box with the AI, backed by a
- * server-side conversation so sessions can be resumed later.
+ * Unified Codiee session — ONE chat box for everything.
+ * Modes are switched from inside the box via slash commands:
+ *   /chat (plain chat) · /toolcall (tools picker) · /agent <description>
  */
 
 const aiService = new AIService();
 
 // Session state
 let projectContext: ProjectContextResult | null = null;
+let sessionMode: "chat" | "tool" = "chat";
 let currentUser: SessionUser | null = null;
 
 type SessionUser = { id: string; name: string };
@@ -61,11 +77,14 @@ async function initConversation(conversationId: string | null) {
   const spin = makeSpinner("Loading conversation...").start();
   const res = await api<{ conversation: ApiConversation; error?: string }>("/api/conversations", {
     method: "POST",
-    body: { mode: "chat", conversationId },
+    body: { mode: sessionMode, conversationId },
   });
   spin.stop();
 
   if (!res.ok) throw new Error(res.data.error || "Could not load conversation");
+
+  // Resume: an old conversation's mode becomes the session's starting mode
+  sessionMode = res.data.conversation.mode === "tool" ? "tool" : "chat";
 
   return res.data.conversation;
 }
@@ -96,7 +115,8 @@ function printAIErrorBox(error: any) {
           chalk.gray(
             "Options:\n" +
               "  • Wait for the limit to reset (daily caps reset midnight Pacific)\n" +
-              "  • Link billing in AI Studio for Tier 1 limits"
+              "  • Link billing in AI Studio for Tier 1 limits\n" +
+              "  • Type /models to switch provider (OpenRouter / NVIDIA / Ollama)"
           ),
         "🚫 Quota"
       )
@@ -107,7 +127,10 @@ function printAIErrorBox(error: any) {
   console.log(errorBox(t.error(`❌ AI request failed: ${msg}`)));
 }
 
-async function getAIResponse(conversationId: string) {
+async function getAIResponse(
+  conversationId: string,
+  useTools = false
+) {
   const spin = makeSpinner("AI is thinking...").start();
 
   const convoRes = await api<{ conversation: ApiConversation; error?: string }>(
@@ -150,19 +173,61 @@ async function getAIResponse(conversationId: string) {
     ...windowed.messages,
   ];
 
+  // Native Google tools only execute on Google's infrastructure — skip them
+  // for any other provider (openrouter / nvidia / ollama).
+  const nativeToolsSupported = aiService.config.provider === "google";
+  const tools = useTools && nativeToolsSupported ? getEnabledTools() : undefined;
+  if (useTools && !nativeToolsSupported) {
+    console.log(
+      warningBox(
+        chalk.yellow(
+          "⚠️  Native tools (search/code-exec) need Gemini — running without tools for this provider."
+        )
+      )
+    );
+  }
+
   let fullResponse = "";
   let isFirstChunk = true;
+  const toolCallsDetected: any[] = [];
 
   try {
-    const result = await aiService.sendMessage(aiMessages, (chunk) => {
-      // Stop spinner on first chunk and show themed response header
-      if (isFirstChunk) {
-        spin.stop();
-        console.log(responseHeader());
-        isFirstChunk = false;
+    const result = await aiService.sendMessage(
+      aiMessages,
+      (chunk) => {
+        // Stop spinner on first chunk and show themed response header
+        if (isFirstChunk) {
+          spin.stop();
+          console.log(responseHeader());
+          isFirstChunk = false;
+        }
+        fullResponse += chunk;
+      },
+      tools,
+      (toolCall) => {
+        toolCallsDetected.push(toolCall);
       }
-      fullResponse += chunk;
-    });
+    );
+
+    // Tool calls / results cards
+    if (toolCallsDetected.length > 0) {
+      console.log(
+        toolCallCard(
+          toolCallsDetected.map((tc) =>
+            `${chalk.cyan("🔧 Tool:")} ${tc.toolName}\n${chalk.gray("Args:")} ${JSON.stringify(tc.args, null, 2)}`
+          )
+        )
+      );
+    }
+    if (result.toolResults && result.toolResults.length > 0) {
+      console.log(
+        toolResultCard(
+          result.toolResults.map((tr: any) =>
+            `${chalk.green("✅ Tool:")} ${tr.toolName}\n${chalk.gray("Result:")} ${JSON.stringify(tr.result, null, 2).slice(0, 200)}...`
+          )
+        )
+      );
+    }
 
     // Render the complete markdown response + themed usage footer
     console.log("\n");
@@ -201,15 +266,104 @@ async function updateConversationTitle(conversationId: string, userInput: string
   }
 }
 
+/* ---------------- Mode switching & flows ---------------- */
+
+async function setMode(mode: "chat" | "tool", conversationId: string) {
+  sessionMode = mode;
+  // Best-effort persistence for resume-correctness
+  await api(`/api/conversations/${conversationId}`, { method: "PATCH", body: { mode } });
+  console.log(
+    infoBox(
+      mode === "tool"
+        ? `${chalk.bold("Mode:")} 🛠️  Tool Calling\n${chalk.gray("Enabled tools: " + (getEnabledToolNames().join(", ") || "none"))}`
+        : `${chalk.bold("Mode:")} 💬 Plain Chat\n${chalk.gray("Tools disabled")}`,
+      "🔁 Mode switched"
+    )
+  );
+}
+
+/** Tools multiselect — returns true when tools were picked (tool mode on). */
+async function openToolPicker(): Promise<boolean> {
+  const { multiselect } = await import("@clack/prompts");
+  const toolOptions = availableTools.map((tool) => ({
+    value: tool.id,
+    label: tool.name,
+    hint: tool.description,
+  }));
+
+  const selected = await multiselect({
+    message: chalk.cyan("Select tools (Space to select, Enter to confirm):"),
+    options: toolOptions,
+    required: false,
+  });
+  if (isCancel(selected)) {
+    cancel("Tool selection cancelled");
+    return false;
+  }
+
+  enableTools(selected as string[]);
+  return true;
+}
+
+/** /agent <description> — inline app generation, then back to chat. */
+async function runAgentFlow(description: string): Promise<void> {
+  if (!description.trim()) {
+    console.log(warningBox(chalk.yellow("Usage: /agent <description>\ne.g. /agent a tiny todo CLI app")));
+    return;
+  }
+
+  const spin = makeSpinner("Generating application...").start();
+  try {
+    spin.stop();
+
+    console.log(userMessage(description));
+    const result = await generateApplication(
+      description,
+      aiService,
+      process.cwd(),
+      null
+    );
+
+    if (result.success && result.commands.length > 0) {
+      const runSetup = await confirm({
+        message: chalk.cyan("Run the setup commands now?"),
+        initialValue: false,
+      });
+      if (!isCancel(runSetup) && runSetup) {
+        await offerToRunSetupCommands(result.commands, process.cwd());
+      } else {
+        console.log("\n" + chalk.yellow("👋 Skip karo — commands baad mein manually chala lena.") + "\n");
+      }
+    }
+  } catch (error: any) {
+    spin.stop();
+    printAIErrorBox(error);
+  }
+}
+
 /* ---------------- Main loop ---------------- */
 
 async function chatLoop(conversation: { id: string }) {
   while (true) {
-    const userInput = (await chatInput("💬 [chat] · type 'exit' to leave", "chat")).trim();
+    const label =
+      sessionMode === "tool"
+        ? "🛠️ [tool] · /help for help"
+        : "💬 [chat] · /help for help";
+
+    const userInput = (await chatInput(label, sessionMode)).trim();
     if (!userInput) continue;
 
-    // Plain "exit" ends the session
-    if (userInput.toLowerCase() === "exit") {
+    // Slash commands — never sent to the AI
+    const slashResult = await handleChatCommand(userInput, {
+      aiService,
+      setMode: (m: "chat" | "tool") => setMode(m, conversation.id),
+      runAgent: runAgentFlow,
+      openToolPicker,
+    });
+    if (slashResult === "handled") continue;
+
+    // /exit (via slash command) and plain "exit" both end the session
+    if (slashResult === "exit" || userInput.toLowerCase() === "exit") {
       console.log("\n" + warningBox(t.warning("Chat session ended. Goodbye! 👋")));
       break;
     }
@@ -224,7 +378,7 @@ async function chatLoop(conversation: { id: string }) {
     // AI response — a failed request must not crash the session
     let aiResponse: string;
     try {
-      aiResponse = await getAIResponse(conversation.id);
+      aiResponse = await getAIResponse(conversation.id, sessionMode === "tool");
     } catch (error) {
       printAIErrorBox(error);
       continue;
@@ -252,6 +406,11 @@ export async function startSession(conversationId: string | null = null) {
     currentUser = user;
     const conversation = await initConversation(conversationId);
 
+    // Re-print header chip if resume changed the starting mode
+    if (sessionMode === "tool") {
+      console.log(warningBox(chalk.yellow("Resumed in 🛠️ tool mode — /chat to switch back")));
+    }
+
     // Attach project context ("Codiee knows your code")
     const ctxSpinner = makeSpinner("Scanning project...").start();
     try {
@@ -268,11 +427,15 @@ export async function startSession(conversationId: string | null = null) {
       ctxSpinner.warning("Could not scan project — continuing without context");
     }
 
+    resetTools(); // start clean; /toolcall picks fresh
+
     await chatLoop(conversation);
 
-    printGoodbye("chat");
+    printGoodbye(sessionMode);
   } catch (error) {
     console.log(errorBox(t.error(`❌ Error: ${error.message}`)));
     process.exit(1);
   }
 }
+
+// Rag grounding and server-side quota sync added later.
