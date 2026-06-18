@@ -26,6 +26,8 @@ import {
   estimateTokens,
   CONTEXT_LIMITS,
 } from "../../lib/context-manager.js";
+import { checkQuota, reportUsage } from "../../lib/quota-client.js";
+import { formatChunksAsContext } from "../../lib/rag-client.js";
 import { handleChatCommand } from "./slash-commands.js";
 import {
   availableTools,
@@ -129,9 +131,34 @@ function printAIErrorBox(error: any) {
 
 async function getAIResponse(
   conversationId: string,
+  query: string | null = null,
   useTools = false
 ) {
   const spin = makeSpinner("AI is thinking...").start();
+
+  // Server-side quota enforcement. Graceful: when the server is unreachable
+  // (offline / Ollama users) the request proceeds.
+  const quotaCheck = await checkQuota();
+  if (!quotaCheck.allowed) {
+    spin.stop();
+    const status = quotaCheck.status;
+    const resetInfo = status?.periodEnd
+      ? new Date(status.periodEnd).toLocaleDateString()
+      : "next month";
+    console.log(
+      errorBox(
+        t.error(
+          `🚫 Monthly token quota exceeded.\n` +
+            `Used ${status?.used ?? "?"} / ${status?.limit ?? "?"} tokens. Resets ${resetInfo}.`
+        ),
+        "🚫 Quota"
+      )
+    );
+    return (
+      "I can't respond right now — your monthly token quota is exhausted. " +
+      "Your limit resets at the start of next month."
+    );
+  }
 
   const convoRes = await api<{ conversation: ApiConversation; error?: string }>(
     `/api/conversations/${conversationId}`
@@ -159,9 +186,25 @@ async function getAIResponse(
     });
   }
 
+  // RAG: retrieve relevant project chunks for this specific question.
+  // Fail-open on the server side — chunks: [] on any failure.
+  let ragContext: string | null = null;
+  if (query && projectContext?.root && currentUser) {
+    const searchRes = await api<{ chunks: { filePath: string; chunkIndex: number; content: string; score: number }[] }>(
+      "/api/rag/search",
+      { method: "POST", body: { query, rootPath: projectContext.root } }
+    );
+    const chunks = searchRes.data.chunks ?? [];
+    ragContext = formatChunksAsContext(chunks);
+    if (ragContext) {
+      spin.text = `Grounding answer with ${chunks.length} code excerpts...`;
+    }
+  }
+
   // Assemble system context blocks (never persisted as messages)
   const systemBlocks: string[] = [];
   if (projectContext?.context) systemBlocks.push(projectContext.context);
+  if (ragContext) systemBlocks.push(ragContext);
   if (windowed.summary) {
     systemBlocks.push(
       `Running summary of earlier parts of this conversation:\n${windowed.summary}`
@@ -252,6 +295,14 @@ async function getAIResponse(
     );
     console.log("\n");
 
+    // Track quota usage server-side
+    await reportUsage({
+      promptTokens,
+      completionTokens,
+      conversationId,
+      model: aiService.label,
+    });
+
     return result.content;
   } catch (error) {
     spin.error("Failed to get AI response");
@@ -314,6 +365,15 @@ async function runAgentFlow(description: string): Promise<void> {
 
   const spin = makeSpinner("Generating application...").start();
   try {
+    // RAG: review the user's project so the result fits their stack
+    let projectInsight: string | null = null;
+    if (projectContext?.root && currentUser) {
+      const searchRes = await api<{ chunks: { filePath: string; chunkIndex: number; content: string; score: number }[] }>(
+        "/api/rag/search",
+        { method: "POST", body: { query: description, rootPath: projectContext.root } }
+      );
+      projectInsight = formatChunksAsContext(searchRes.data.chunks ?? []);
+    }
     spin.stop();
 
     console.log(userMessage(description));
@@ -321,7 +381,7 @@ async function runAgentFlow(description: string): Promise<void> {
       description,
       aiService,
       process.cwd(),
-      null
+      projectInsight
     );
 
     if (result.success && result.commands.length > 0) {
@@ -378,7 +438,7 @@ async function chatLoop(conversation: { id: string }) {
     // AI response — a failed request must not crash the session
     let aiResponse: string;
     try {
-      aiResponse = await getAIResponse(conversation.id, sessionMode === "tool");
+      aiResponse = await getAIResponse(conversation.id, userInput, sessionMode === "tool");
     } catch (error) {
       printAIErrorBox(error);
       continue;
@@ -437,5 +497,3 @@ export async function startSession(conversationId: string | null = null) {
     process.exit(1);
   }
 }
-
-// Rag grounding and server-side quota sync added later.
