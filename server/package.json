@@ -7,7 +7,7 @@
     "dev": "tsx watch src/index.ts",
     "start": "tsx src/index.ts",
     "cli": "tsx src/cli/main.ts",
-    "build": "tsc",
+    "build": "tsc && chmod +x dist/cli/main.js",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest"
