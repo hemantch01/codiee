@@ -13,6 +13,14 @@ import { ChatService } from "./services/chat.services.js";
 import { issueOtp, verifyOtp } from "./lib/otp.js";
 import { sendOtpEmail } from "./lib/mailer.js";
 import { EMAIL_RE } from "./lib/email.js";
+import {
+  diffIndexedFiles,
+  upsertChunks,
+  deleteIndexedFiles,
+  clearIndex,
+  getIndexStats,
+} from "./lib/rag-store.js";
+import { retrieveRelevantChunks } from "./lib/retriever.js";
 
 const chatService = new ChatService();
 
@@ -313,6 +321,122 @@ app.post("/api/conversations/:id/messages", apiLimiter, express.json(), async (r
   return res.json({ message, count });
 });
 
+// RAG sync — the CLI scans/chunks/embeds locally; the server stores and serves.
+
+app.post("/api/rag/diff", apiLimiter, express.json(), async (req, res) => {
+  const userId = await requireUserId(req);
+  if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+  const body = (req.body ?? {}) as { root?: string; files?: { relPath?: string; hashes?: unknown }[] };
+  const root = String(body.root ?? "");
+  if (!root || !Array.isArray(body.files)) {
+    return res.status(400).json({ error: "root and files are required" });
+  }
+  const files = body.files
+    .filter((f) => typeof f?.relPath === "string" && Array.isArray(f.hashes))
+    .map((f) => ({ relPath: f.relPath as string, hashes: (f.hashes as any[]).map(String) }));
+
+  try {
+    return res.json(await diffIndexedFiles(userId, root, files));
+  } catch (error) {
+    logger.error({ err: error }, "RAG diff failed");
+    return res.status(500).json({ error: "Could not diff the index" });
+  }
+});
+
+app.post("/api/rag/delete-files", apiLimiter, express.json(), async (req, res) => {
+  const userId = await requireUserId(req);
+  if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+  const body = (req.body ?? {}) as { root?: string; files?: string[] };
+  const root = String(body.root ?? "");
+  const files = Array.isArray(body.files) ? body.files.map(String).slice(0, 5000) : [];
+  if (!root) return res.status(400).json({ error: "root is required" });
+
+  try {
+    return res.json({ removed: await deleteIndexedFiles(userId, root, files) });
+  } catch (error) {
+    logger.error({ err: error }, "RAG delete failed");
+    return res.status(500).json({ error: "Could not update the index" });
+  }
+});
+
+app.post("/api/rag/upsert", apiLimiter, express.json(), async (req, res) => {
+  const userId = await requireUserId(req);
+  if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+  const body = (req.body ?? {}) as { root?: string; chunks?: any[] };
+  const root = String(body.root ?? "");
+  if (!root || !Array.isArray(body.chunks)) {
+    return res.status(400).json({ error: "root and chunks are required" });
+  }
+  const chunks = body.chunks.slice(0, 200).filter(
+    (c) =>
+      typeof c?.filePath === "string" &&
+      Number.isInteger(c?.chunkIndex) &&
+      typeof c?.content === "string" &&
+      typeof c?.contentHash === "string" &&
+      Array.isArray(c?.embedding)
+  );
+
+  try {
+    return res.json({ indexed: await upsertChunks(userId, root, chunks) });
+  } catch (error) {
+    logger.error({ err: error }, "RAG upsert failed");
+    return res.status(500).json({ error: "Could not store chunks" });
+  }
+});
+
+app.post("/api/rag/clear", apiLimiter, express.json(), async (req, res) => {
+  const userId = await requireUserId(req);
+  if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+  const body = (req.body ?? {}) as { root?: string };
+  const root = String(body.root ?? "");
+  if (!root) return res.status(400).json({ error: "root is required" });
+
+  try {
+    return res.json({ removed: await clearIndex(userId, root) });
+  } catch (error) {
+    logger.error({ err: error }, "RAG clear failed");
+    return res.status(500).json({ error: "Could not clear the index" });
+  }
+});
+
+app.get("/api/rag/stats", apiLimiter, async (req, res) => {
+  const userId = await requireUserId(req);
+  if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+  const root = String(req.query.root ?? "");
+  if (!root) return res.status(400).json({ error: "root is required" });
+
+  try {
+    return res.json(await getIndexStats(userId, root));
+  } catch (error) {
+    logger.error({ err: error }, "RAG stats failed");
+    return res.status(500).json({ error: "Could not read index stats" });
+  }
+});
+
+app.post("/api/rag/search", apiLimiter, express.json(), async (req, res) => {
+  const userId = await requireUserId(req);
+  if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+  const body = (req.body ?? {}) as { query?: string; rootPath?: string };
+  const query = String(body.query ?? "");
+  const rootPath = String(body.rootPath ?? "");
+  if (!query.trim() || !rootPath) {
+    return res.status(400).json({ error: "query and rootPath are required" });
+  }
+
+  try {
+    return res.json({ chunks: await retrieveRelevantChunks(query, userId, rootPath) });
+  } catch (error) {
+    logger.error({ err: error }, "RAG search failed");
+    return res.json({ chunks: [] }); // fail-open: never block the answer
+  }
+});
+
 // Express 5 wildcard fallback for unknown routes
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found" });
@@ -354,5 +478,3 @@ if (isDirectRun()) {
     logger.info(`Codiee auth server listening on port ${port}`);
   });
 }
-
-// Rag sync routes (diff / upsert / search) added later
