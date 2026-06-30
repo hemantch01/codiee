@@ -1,0 +1,71 @@
+# Codiee local/self-host stack
+# Usage:  docker compose up --build
+#
+# - db:     Postgres 16 with the pgvector extension pre-installed
+# - server: Express auth API (built from ./server)
+#
+# After first boot, apply migrations once:
+#   docker compose exec server npx prisma migrate deploy
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: codiee-db
+    environment:
+      POSTGRES_USER: codiee
+      POSTGRES_PASSWORD: codiee
+      POSTGRES_DB: codiee
+    ports:
+      # Host port defaults to 5433 to avoid clashing with a local Postgres.
+      # Override with DB_HOST_PORT=5432 if you don't have one running.
+      - "${DB_HOST_PORT:-5433}:5432"
+    volumes:
+      - codiee-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U codiee -d codiee"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: codiee-mailpit
+    ports:
+      - "8025:8025" # web UI — dev inbox at http://localhost:8025
+      - "1025:1025" # SMTP
+
+  server:
+    build:
+      context: ./server
+    container_name: codiee-server
+    environment:
+      DATABASE_URL: postgresql://codiee:codiee@db:5432/codiee
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:-change-me-in-production}
+      PORT: 3005
+      LOG_LEVEL: info
+      # Monthly token quota enforced server-side
+      QUOTA_MONTHLY_TOKENS: ${QUOTA_MONTHLY_TOKENS:-500000}
+      # Signup OTP mail — Mailpit dev inbox by default; point at a real SMTP
+      # provider (e.g. smtp.gmail.com + app password) for real emails.
+      SMTP_HOST: ${SMTP_HOST:-mailpit}
+      SMTP_PORT: ${SMTP_PORT:-1025}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: '${SMTP_FROM:-Codiee <no-reply@codiee.local>}'
+      # Optional: pass through for AI features if set in your shell/.env
+      GOOGLE_GENERATIVE_AI_API_KEY: ${GOOGLE_GENERATIVE_AI_API_KEY:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      NVIDIA_API_KEY: ${NVIDIA_API_KEY:-}
+    ports:
+      - "3005:3005"
+    depends_on:
+      db:
+        condition: service_healthy
+      mailpit:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  codiee-pgdata:
