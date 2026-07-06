@@ -1,0 +1,97 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  server:
+    name: Server — typecheck, test, build
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: codiee
+          POSTGRES_PASSWORD: codiee
+          POSTGRES_DB: codiee_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U codiee"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    defaults:
+      run:
+        working-directory: server
+
+    env:
+      DATABASE_URL: postgresql://codiee:codiee@localhost:5432/codiee_test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Apply migrations (incl. pgvector)
+        run: npx prisma migrate deploy
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+  docker:
+    name: Docker — build & publish
+    runs-on: ubuntu-latest
+    needs: [server]
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # CD: publish to GitHub Container Registry from main
+      - name: Log in to GHCR
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Builds on every PR (validates the Dockerfile); pushes only from main
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./server
+          push: ${{ github.ref == 'refs/heads/main' && github.event_name == 'push' }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/codiee-server:latest
+            ghcr.io/${{ github.repository_owner }}/codiee-server:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
